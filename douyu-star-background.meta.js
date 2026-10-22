@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         斗鱼全民星推荐自动领取
 // @namespace    local.douyu.star.helper
-// @version      2.0.3
+// @version      2.0.4
 // @description  后台自动领取全民星推荐活动红包，支持奖池筛选、到账统计及每日上限自动停止。
 // @homepageURL  https://github.com/ybl112/douyu-star-helper
 // @supportURL   https://github.com/ybl112/douyu-star-helper/issues

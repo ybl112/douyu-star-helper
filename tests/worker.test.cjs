@@ -90,36 +90,28 @@ test('worker replies retain result semantics without persisting packet or creden
 function workerHarness() {
   const store = bus(), intervals = new Map();
   const token = 'a'.repeat(32), key = `bg2.worker.${token}`;
-  let now = Date.UTC(2026, 9, 22, 4), frame = null, closed = 0, intervalId = 0;
-  let entryClicks = 0, lotteryClicks = 0;
+  let now = Date.UTC(2026, 9, 22, 4), rendered = false, remaining = 12, closed = 0, intervalId = 0;
+  let entryClicks = 0;
+  let gate = null;
   const fetches = [];
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
-  const label = (value, click) => ({ nodeValue: value, parentElement: { closest: () => null, click } });
-  const activityDoc = {
-    body: { innerText: '新星榜 抽大奖' },
-    createTreeWalker() {
-      let read = false;
-      return { nextNode() {
-        if (read) return null; read = true;
-        return label('抽大奖', () => { lotteryClicks++; activityDoc.body.innerText = '我的金币 做任务得金币 抢红包'; });
-      } };
+  const bag = {
+    querySelector(selector) {
+      if (selector.endsWith('--btn')) return remaining > 0 ? { textContent: `${remaining}秒后可抢` } : null;
+      if (selector.endsWith('--btnOpen')) return remaining === 0 ? { style: {}, hidden: false } : null;
+      return null;
     }
   };
   const document = {
     scripts: [{ src: '', textContent: '' }], readyState: 'complete', cookie: 'acf_ccn=fake-csrf-for-test', body: {},
-    querySelector: () => frame, querySelectorAll: () => [], addEventListener() {},
-    createTreeWalker() {
-      let read = false;
-      return { nextNode() {
-        if (read) return null; read = true;
-        return label('全民星推', () => { entryClicks++; frame = { contentDocument: activityDoc }; });
-      } };
-    }
+    getElementById: id => rendered && id === 'LiveNewAnchorSupportT-bagReadySvga-123' ? { closest: () => bag } : null,
+    querySelector: selector => selector === '.LiveNewAnchorSupportT-enter' ? { click() { entryClicks++; rendered = true; } } : null,
+    querySelectorAll: () => [], addEventListener() {}
   };
-  store.set(key, { owner: 'controller', rid: '101', ready: false, expires: now + 3600000,
+  store.set(key, { owner: 'controller', rid: '101', bagId: '123', ready: false, expires: now + 3600000,
     csrfConfig: { field: 'ctn', cookie: 'acf_ccn' } });
   store.set('bg2.lease', { owner: 'controller', until: now + 3600000 });
-  const window = { close() { closed++; } }; window.top = window;
+  const window = { close() { closed++; }, addEventListener() {} }; window.top = window;
   const context = { window, document, location: { pathname: '/101', hash: `#dy-star-worker=${token}`, origin: 'https://www.douyu.com' },
     Date: Clock, crypto: { randomUUID: () => 'b'.repeat(32) }, NodeFilter: { SHOW_TEXT: 4 },
     URL, URLSearchParams, AbortController, console, setTimeout, clearTimeout,
@@ -129,6 +121,7 @@ function workerHarness() {
     GM_removeValueChangeListener: store.unlisten,
     fetch: async (url, init) => {
       fetches.push({ url, init });
+      if (gate) await gate(url, init);
       return { ok: true, json: async () => init.method === 'POST'
         ? { error: 0, data: { prizeList: [{ prizeType: 9, num: 18 }] } }
         : { error: 0, data: { redBagList: [{ id: 123, code: 'fresh-local-code', status: 0, waitSec: 300, prizeList: [] }] } } };
@@ -136,18 +129,19 @@ function workerHarness() {
   };
   vm.runInNewContext(source, context, { filename: 'douyu-star-background.user.js' });
   return { store, key, fetches, get: () => store.get(key), closed: () => closed,
-    clicks: () => ({ entry: entryClicks, lottery: lotteryClicks }),
+    gate: fn => { gate = fn; }, cookie: value => { document.cookie = value; },
+    clicks: () => ({ entry: entryClicks }), setRemaining: value => { remaining = value; }, hide: () => { rendered = false; },
     async tick(ms = 2000) { now += ms; for (const fn of [...intervals.values()]) fn(); await settle(); },
-    async initialize() { await this.tick(9000); await this.tick(); await this.tick(); await this.tick(4000); }
+    async initialize() { remaining = 0; await this.tick(); }
   };
 }
 
-test('a fully loaded worker still opens and initializes the official activity before readiness', async () => {
+test('a loaded worker opens the official packet component and reads its actual seconds without estimating', async () => {
   const h = workerHarness();
-  await h.tick(9000); assert.equal(h.get().ready, false); assert.equal(h.clicks().entry, 1);
-  await h.tick(); assert.equal(h.get().ready, false); assert.equal(h.clicks().lottery, 1);
-  await h.tick(); assert.equal(h.get().ready, false);
-  await h.tick(4000); assert.equal(h.get().ready, true); assert.ok(h.get().readyAt);
+  assert.equal(h.get().ready, false); assert.equal(h.clicks().entry, 1);
+  await h.tick(); assert.equal(h.get().ready, true); assert.equal(h.get().timer.remainingSec, 12);
+  await h.tick(60000); assert.equal(h.get().timer.remainingSec, 12);
+  h.setRemaining(4); await h.tick(); assert.equal(h.get().timer.remainingSec, 4);
 });
 
 test('the real worker adapter submits from its room exactly once per command', async () => {
@@ -167,4 +161,52 @@ test('revoking a worker task closes only that registered worker and prevents new
   const h = workerHarness(); await h.initialize();
   h.store.set(h.key, undefined); await h.tick();
   assert.ok(h.closed() > 0); assert.equal(h.fetches.length, 0);
+});
+
+test('a worker refuses a command while its exact packet still has a countdown', async () => {
+  const h = workerHarness(); await h.tick();
+  h.store.set(h.key, { ...h.get(), command: { requestId: 'early', bagId: 123 } });
+  await settle(); assert.equal(h.fetches.length, 0);
+  assert.equal(h.get().response.payload.localState, 'waiting');
+});
+
+test('a command for a different packet never uses the visible packet readiness', async () => {
+  const h = workerHarness(); await h.initialize();
+  h.store.set(h.key, { ...h.get(), command: { requestId: 'wrong', bagId: 124 } });
+  await settle(); assert.equal(h.fetches.length, 0);
+});
+
+test('lost readiness between controller sampling and dispatch pauses rather than stopping all rooms', async () => {
+  const { store, bridge } = bridgeHarness(); store.set('worker', { ready: false });
+  assert.equal((await bridge.claim('worker', 123)).localState, 'waiting');
+  assert.equal(bridge.pending.size, 0); assert.equal(store.get('worker').command, undefined);
+});
+
+test('revocation while refreshing the packet code cannot send a late claim', async () => {
+  const h = workerHarness(); await h.initialize();
+  let release;
+  h.gate(() => new Promise(resolve => { release = resolve; }));
+  h.store.set(h.key, { ...h.get(), command: { requestId: 'revoked', bagId: 123 } }); await settle();
+  h.store.set(h.key, undefined); release(); await settle();
+  assert.equal(h.fetches.filter(item => item.init.method === 'POST').length, 0);
+  assert.ok(h.closed() > 0);
+});
+
+test('the actual countdown is checked again after the room-list request completes', async () => {
+  const h = workerHarness(); await h.initialize();
+  let release; h.gate(() => new Promise(resolve => { release = resolve; }));
+  h.store.set(h.key, { ...h.get(), command: { requestId: 'changed', bagId: 123 } }); await settle();
+  h.setRemaining(8); release(); await settle();
+  assert.equal(h.fetches.filter(item => item.init.method === 'POST').length, 0);
+  assert.equal(h.get().response.payload.localState, 'waiting');
+});
+
+test('stopping during CSRF initialization also prevents the final POST', async () => {
+  const h = workerHarness(); await h.initialize(); h.cookie('');
+  let release;
+  h.gate(url => url.includes('getCsrfCookie') ? new Promise(resolve => { release = resolve; }) : undefined);
+  h.store.set(h.key, { ...h.get(), command: { requestId: 'csrf-race', bagId: 123 } }); await settle();
+  assert.equal(typeof release, 'function');
+  h.store.set(h.key, undefined); h.cookie('acf_ccn=fake-after-initialization'); release(); await settle();
+  assert.equal(h.fetches.filter(item => item.init.method === 'POST').length, 0);
 });
