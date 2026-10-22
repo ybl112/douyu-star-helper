@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         斗鱼全民星推荐自动领取
 // @namespace    local.douyu.star.helper
-// @version      2.0.4
+// @version      2.0.5
 // @description  后台自动领取全民星推荐活动红包，支持奖池筛选、到账统计及每日上限自动停止。
 // @homepageURL  https://github.com/ybl112/douyu-star-helper
 // @supportURL   https://github.com/ybl112/douyu-star-helper/issues
@@ -9,7 +9,7 @@
 // @updateURL    https://raw.githubusercontent.com/ybl112/douyu-star-helper/main/douyu-star-background.meta.js
 // @match        https://www.douyu.com/*
 // @noframes
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -18,6 +18,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @grant        GM_info
+// @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @connect      raw.githubusercontent.com
 // @grant        window.close
@@ -51,7 +52,7 @@
  * SOFTWARE.
  */
 
-/* global GM_getValue, GM_setValue, GM_deleteValue, GM_addValueChangeListener, GM_removeValueChangeListener, GM_registerMenuCommand, GM_openInTab, GM_info, GM_xmlhttpRequest */
+/* global GM_getValue, GM_setValue, GM_deleteValue, GM_addValueChangeListener, GM_removeValueChangeListener, GM_registerMenuCommand, GM_openInTab, GM_info, GM_xmlhttpRequest, unsafeWindow */
 (function () {
   'use strict';
 
@@ -167,6 +168,65 @@
       if (drag) end({ pointerId: drag.id });
       for (const [name, fn] of Object.entries(events)) handle.removeEventListener(name, fn);
       handle.removeEventListener('click', click, true);
+    };
+  }
+
+  function registeredWorker(task, lease, at) {
+    return Boolean(task && !task.revoked && safeId(task.rid) && safeId(task.bagId) && task.owner &&
+      task.owner === lease?.owner && task.expires >= at && lease.until >= at - 90000);
+  }
+
+  function backgroundFrames(page, doc, { setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+    const nativeFrame = page.requestAnimationFrame, nativeCancel = page.cancelAnimationFrame;
+    if (typeof nativeFrame !== 'function' || typeof nativeCancel !== 'function') return () => {};
+    const pending = new Map(); let sequence = 1000000000, disposed = false;
+    const hidden = () => doc.visibilityState === 'hidden' || doc.hidden === true;
+    const finish = (record, timestamp) => {
+      if (disposed || !pending.delete(record.id)) return;
+      clearTimer(record.timer); nativeCancel.call(page, record.native);
+      record.callback.call(page, timestamp);
+    };
+    const arm = record => {
+      if (record.timer !== null) return;
+      // Let the real official callback run at most once/second while Chrome suspends rAF.
+      // This changes scheduling only, never visibility, clocks or packet time values.
+      record.timer = setTimer(() => {
+        record.timer = null;
+        if (hidden()) finish(record, page.performance.now());
+      }, 1000);
+    };
+    function requestFrame(callback) {
+      if (typeof callback !== 'function') throw new TypeError('requestAnimationFrame requires a function');
+      const record = { id: ++sequence, callback, timer: null, native: null };
+      pending.set(record.id, record);
+      record.native = nativeFrame.call(page, timestamp => finish(record, timestamp));
+      if (hidden()) arm(record);
+      return record.id;
+    }
+    function cancelFrame(id) {
+      const record = pending.get(id);
+      if (!record) { nativeCancel.call(page, id); return; }
+      pending.delete(id); clearTimer(record.timer); nativeCancel.call(page, record.native);
+    }
+    const visibility = () => {
+      for (const record of pending.values()) {
+        if (hidden()) arm(record);
+        else { clearTimer(record.timer); record.timer = null; }
+      }
+    };
+    try { page.requestAnimationFrame = requestFrame; page.cancelAnimationFrame = cancelFrame; }
+    catch {
+      if (page.requestAnimationFrame === requestFrame) page.requestAnimationFrame = nativeFrame;
+      return () => {};
+    }
+    doc.addEventListener('visibilitychange', visibility);
+    return () => {
+      if (disposed) return;
+      disposed = true; doc.removeEventListener('visibilitychange', visibility);
+      for (const record of pending.values()) { clearTimer(record.timer); nativeCancel.call(page, record.native); }
+      pending.clear();
+      if (page.requestAnimationFrame === requestFrame) page.requestAnimationFrame = nativeFrame;
+      if (page.cancelAnimationFrame === cancelFrame) page.cancelAnimationFrame = nativeCancel;
     };
   }
 
@@ -605,7 +665,7 @@
     }
   }
 
-  const Core = { BASE, RELEASE, normalizePayload, compareVersions, parseUpdateMeta, fetchRelease, clampPosition, bindDrag,
+  const Core = { BASE, RELEASE, normalizePayload, compareVersions, parseUpdateMeta, fetchRelease, clampPosition, bindDrag, registeredWorker, backgroundFrames,
     DEFAULTS, options, prizes, compareBags, parseBags, classify, readOfficialTimer, observedTimer, claimInRoom, workerReply, WorkerBridge, csrfConfig, freshDB, dayKey, Engine };
   if (typeof window === 'undefined') {
     if (typeof module !== 'undefined') module.exports = Core;
@@ -613,10 +673,19 @@
   }
   if (window.top !== window || !/^\/\d+\/?$/.test(location.pathname)) return;
 
-  // Browser adapter and UI follow below.
-  bootstrap(Core);
+  // Install in the page realm before official scripts can capture the native rAF function.
+  const earlyToken = location.hash.match(/(?:^#|&)dy-star-worker=([a-f0-9]{32})(?:&|$)/)?.[1];
+  let restoreFrames = () => {};
+  if (earlyToken && registeredWorker(GM_getValue(`bg2.worker.${earlyToken}`, null), GM_getValue('bg2.lease', null), Date.now())) {
+    const page = typeof unsafeWindow === 'object' ? unsafeWindow : window;
+    restoreFrames = backgroundFrames(page, document);
+    window.addEventListener('pagehide', restoreFrames, { once: true });
+  }
+  const boot = () => bootstrap(Core, restoreFrames);
+  if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', boot, { once: true });
+  else boot();
 
-  function bootstrap(core) {
+  function bootstrap(core, restoreFrames) {
     const PREF = 'bg2.preferences', DB = 'bg2.database', LEASE = 'bg2.lease', SNAP = 'bg2.snapshot';
     const workerKey = token => `bg2.worker.${token}`;
     const readPrefs = () => ({ enabled: false, controlPath: '', ...GM_getValue(PREF, {}), ...core.options(GM_getValue(PREF, {})) });
@@ -681,6 +750,7 @@
       }
       function cleanup(close = false) {
         clearInterval(workerTimer); GM_removeValueChangeListener(listener);
+        restoreFrames();
         observer?.disconnect(); clearTimeout(observePending);
         for (const controller of requests) controller.abort();
         if (close) window.close();
@@ -730,6 +800,7 @@
         observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true });
       }
       window.addEventListener('pagehide', () => cleanup(), { once: true });
+      document.addEventListener('visibilitychange', () => { observeTimer(); void dispatch(); });
       observeTimer();
     }
 
@@ -846,6 +917,7 @@
       shadow.innerHTML = `<style>
         *{box-sizing:border-box}.card{width:370px;max-height:85vh;overflow:auto;padding:16px;background:#181b24;color:#e9edf4;border:1px solid #41495b;border-radius:14px;box-shadow:0 8px 36px #0006;font:13px/1.5 system-ui,"Microsoft YaHei",sans-serif}header,nav,.row{display:flex;justify-content:space-between;gap:8px;align-items:center}header b{font-size:15px}button{font:inherit;border:0;border-radius:7px;background:#ff6c2d;color:#fff;padding:7px 11px;cursor:pointer}.secondary{background:#343c4c}.small{padding:3px 8px;background:#343c4c}.muted{color:#9da8bd;font-size:12px;margin:9px 0}.totals{display:flex;justify-content:space-between;padding:12px;background:#242a38;border-radius:9px;margin:12px 0}.totals strong{color:#ffb16c;font-size:20px;display:block}.totals small{color:#a9b3c6}details{margin-top:12px;border-top:1px solid #343c4c;padding-top:10px}summary{cursor:pointer;color:#bfc8d8}label{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:9px 0}input{width:105px;padding:5px;background:#10141c;border:1px solid #495268;border-radius:5px;color:#fff;font:inherit}input[type=checkbox]{width:auto}.jobs{display:grid;gap:6px;margin-top:10px}.job{padding:8px;background:#242a38;border-radius:7px;font-size:12px}a{color:#ffc18c;text-decoration:none}ol{max-height:220px;overflow:auto;margin:10px 0;padding-left:20px;font-size:11px;color:#aebbd1}li{margin:5px 0}.chip{font:12px/1.5 system-ui,"Microsoft YaHei",sans-serif;padding:9px 12px;box-shadow:0 4px 20px #0004}.hidden{display:none!important}.status{white-space:normal;word-break:break-word}
         .card{max-width:calc(100vw - 16px);max-height:calc(100vh - 16px)}header,.chip{touch-action:none;user-select:none;cursor:grab}header:active,.chip:active{cursor:grabbing}.release{margin-top:9px;font-size:12px;color:#a9b3c6;flex-wrap:wrap}button:disabled{opacity:.55;cursor:wait}.version-status:empty{display:none}
+        .record-list{list-style:none;padding-left:0;max-height:220px;overflow:auto;margin:10px 0;font-size:11px;color:#aebbd1}
       </style><button class="chip" title="点击展开，拖动可调整位置">星推 · 已停止</button><section class="card hidden">
         <header title="拖动标题栏可调整位置"><b>斗鱼全民星推荐自动领取</b><button class="small fold">收起</button></header>
         <div class="row release"><span class="current-version"></span><button class="small update-check">检查版本</button><button class="small update-install hidden">更新到最新版</button></div>
@@ -863,7 +935,7 @@
           <label>默认收起面板<input name="compact" type="checkbox"></label>
           <button class="save secondary">保存设置</button><p class="muted">按金币总奖池排序，实际分到的金币取决于斗鱼。达到斗鱼上限后停止，不会次日自动重启。</p>
         </details>
-        <details class="records"><summary>领取记录与导出</summary><ol></ol><button class="export secondary">导出本地记录</button><button class="history secondary">查询斗鱼金币记录</button><p class="muted historyText"></p></details>
+        <details class="records"><summary>领取记录与导出</summary><ul class="record-list"></ul><button class="export secondary">导出本地记录</button><button class="history secondary">查询斗鱼金币记录</button><p class="muted historyText"></p></details>
       </section>`;
       card = shadow.querySelector('.card'); collapsed = shadow.querySelector('.chip');
       collapsed.addEventListener('click', () => fold(false));
@@ -955,7 +1027,7 @@
         line.appendChild(document.createTextNode(` · 奖池 ${job.coins} 金币 · ${status}`)); box.appendChild(line);
       }
       if (shadow.querySelector('.records').open) {
-        const list = shadow.querySelector('ol'); list.replaceChildren();
+        const list = shadow.querySelector('.record-list'); list.replaceChildren();
         for (const record of db.records.slice(0, 40)) {
           const li = document.createElement('li'); li.textContent = `${new Date(record.at).toLocaleTimeString()} ${record.text}`; list.appendChild(li);
         }
