@@ -1,0 +1,12 @@
+{
+  "name": "douyu-star-helper",
+  "version": "2.0.0",
+  "private": true,
+  "description": "斗鱼全民星推荐自动领取油猴脚本",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test tests/background.test.cjs",
+    "check": "node --check douyu-star-background.user.js"
+  }
+}
