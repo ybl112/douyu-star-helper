@@ -45,23 +45,7 @@
 
 ## 参考与致谢
 
-本项目使用了以下直接参考及间接来源，具体范围分别标注如下。
-
-| 项目 / 作者 | 关系 | 借鉴范围 | 标注位置 |
-| --- | --- | --- | --- |
-| [ienone/douyu-qmx-pro](https://github.com/ienone/douyu-qmx-pro)，MIT | 直接参考 | 接口字段和错误码、金币/星光棒奖品映射、动态CSRF字段解析、每包有限5次的请求时间安排；后台控制页调度作为架构参考 | 脚本顶部许可，以及 `prizes`、`parseBags`、`classify`、`offsets`、`csrfConfig` 函数旁的来源链接 |
-| [ysl-ovo：斗鱼全民星推荐自动领取](https://greasyfork.org/zh-CN/scripts/532514)，MIT | 间接来源 | `douyu-qmx-pro` 在其 README 中声明基于此原版脚本开发；本项目未直接引入原版脚本代码 | 本表、脚本顶部及第三方声明 |
-
-直接参考的固定版本：[`93accebf2983a49811ee218da7adf50547408575`](https://github.com/ienone/douyu-qmx-pro/tree/93accebf2983a49811ee218da7adf50547408575)。
-
-具体参考文件：
-
-- [RedBagState.js](https://github.com/ienone/douyu-qmx-pro/blob/93accebf2983a49811ee218da7adf50547408575/src/features/redbag/RedBagState.js)：奖品映射、错误码分类与5次领取调度。
-- [CsrfConfig.js](https://github.com/ienone/douyu-qmx-pro/blob/93accebf2983a49811ee218da7adf50547408575/src/platform/douyu/CsrfConfig.js)：动态CSRF字段与Cookie名称解析。
-- [DouyuAPI.js](https://github.com/ienone/douyu-qmx-pro/blob/93accebf2983a49811ee218da7adf50547408575/src/utils/DouyuAPI.js) 和 [接口研究文档](https://github.com/ienone/douyu-qmx-pro/blob/93accebf2983a49811ee218da7adf50547408575/docs/DOUYU_REDPACKET_API.md)：房间发现、房间奖池与领取请求的协议字段。
-- [RedBagTaskController.js](https://github.com/ienone/douyu-qmx-pro/blob/93accebf2983a49811ee218da7adf50547408575/src/features/redbag/RedBagTaskController.js)：后台控制页任务架构参考。
-
-本项目另行实现了任务引擎、界面、可配置奖池筛选、单控制页互斥、绝对时间调度、停止策略、日志导出及模拟测试。相应第三方版权和MIT许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+参考了 [ienone/douyu-qmx-pro](https://github.com/ienone/douyu-qmx-pro) 的接口处理与领取调度，感谢作者及其上游 [ysl-ovo原版脚本](https://greasyfork.org/zh-CN/scripts/532514) 的分享。相关许可见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
 ## 开发与测试
 
