@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         斗鱼全民星推荐自动领取
 // @namespace    local.douyu.star.helper
-// @version      2.0.2
+// @version      2.0.3
 // @description  后台自动领取全民星推荐活动红包，支持奖池筛选、到账统计及每日上限自动停止。
 // @homepageURL  https://github.com/ybl112/douyu-star-helper
 // @supportURL   https://github.com/ybl112/douyu-star-helper/issues
@@ -17,6 +17,9 @@
 // @grant        GM_removeValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        GM_info
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // @grant        window.close
 // @license      MIT
 // ==/UserScript==
@@ -48,7 +51,7 @@
  * SOFTWARE.
  */
 
-/* global GM_getValue, GM_setValue, GM_deleteValue, GM_addValueChangeListener, GM_removeValueChangeListener, GM_registerMenuCommand, GM_openInTab */
+/* global GM_getValue, GM_setValue, GM_deleteValue, GM_addValueChangeListener, GM_removeValueChangeListener, GM_registerMenuCommand, GM_openInTab, GM_info, GM_xmlhttpRequest */
 (function () {
   'use strict';
 
@@ -59,6 +62,104 @@
   const dayKey = (at = Date.now()) => new Date(at + 8 * 3600000).toISOString().slice(0, 10);
   const safeId = value => /^\d{1,15}$/.test(String(value || '')) ? String(value) : '';
   const keyOf = bag => `${bag.rid}:${bag.id}`;
+  const RELEASE = Object.freeze({ name: '斗鱼全民星推荐自动领取', namespace: 'local.douyu.star.helper',
+    downloadURL: 'https://raw.githubusercontent.com/ybl112/douyu-star-helper/main/douyu-star-background.user.js',
+    metadataURL: 'https://raw.githubusercontent.com/ybl112/douyu-star-helper/main/douyu-star-background.meta.js' });
+
+  function compareVersions(a, b) {
+    const parts = value => {
+      if (typeof value !== 'string' || !/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(value)) throw new Error('版本号格式异常');
+      return value.split('.').map(Number);
+    };
+    const left = parts(a), right = parts(b);
+    for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return Math.sign(left[i] - right[i]);
+    return 0;
+  }
+
+  function parseUpdateMeta(text) {
+    if (typeof text !== 'string' || text.length > 32768 ||
+        !/^\/\/ ==UserScript==\r?\n[\s\S]*?\/\/ ==\/UserScript==\s*$/.test(text)) throw new Error('版本信息格式异常');
+    const field = name => text.match(new RegExp(`^// @${name} +([^\\r\\n]+)`, 'm'))?.[1].trim();
+    if (field('name') !== RELEASE.name || field('namespace') !== RELEASE.namespace ||
+        field('downloadURL') !== RELEASE.downloadURL) throw new Error('版本信息不属于本脚本');
+    const version = field('version'); compareVersions(version, version);
+    return version;
+  }
+
+  function fetchRelease(send, { setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+    return new Promise((resolve, reject) => {
+      let handle, settled = false;
+      const finish = (callback, result) => {
+        if (settled) return;
+        settled = true; clearTimer(timer); callback(result);
+      };
+      // Anonymous requests may use fetch internally, so keep our own timeout as well.
+      const timer = setTimer(() => {
+        finish(reject, new Error('检查超时，请稍后重试'));
+        try { handle?.abort(); } catch { /* Already completed. */ }
+      }, 15000);
+      try {
+        handle = send({ method: 'GET', url: RELEASE.metadataURL, anonymous: true, nocache: true,
+          revalidate: true, timeout: 15000, headers: { Accept: 'text/plain' },
+          onload(response) {
+            try {
+              const final = new URL(response.finalUrl || RELEASE.metadataURL), expected = new URL(RELEASE.metadataURL);
+              if (response.status !== 200 || final.origin !== expected.origin || final.pathname !== expected.pathname) {
+                throw new Error('无法读取版本信息，请稍后重试');
+              }
+              finish(resolve, parseUpdateMeta(response.responseText));
+            } catch (error) { finish(reject, error); }
+          },
+          onerror: () => finish(reject, new Error('网络连接失败，请稍后重试')),
+          ontimeout: () => finish(reject, new Error('检查超时，请稍后重试')),
+          onabort: () => finish(reject, new Error('检查已取消')) });
+      } catch { finish(reject, new Error('检查失败，请确认油猴允许访问更新地址')); }
+    });
+  }
+
+  function clampPosition(position, size, viewport) {
+    return { x: Math.round(Math.max(8, Math.min(number(position?.x, 18), Math.max(8, viewport.width - size.width - 8)))),
+      y: Math.round(Math.max(8, Math.min(number(position?.y, 18), Math.max(8, viewport.height - size.height - 8)))) };
+  }
+
+  function bindDrag(handle, { rect, viewport, move, save, now = () => Date.now() }) {
+    let drag = null, suppressUntil = 0;
+    const down = event => {
+      if (drag || event.isPrimary === false || event.button !== 0 ||
+          (event.target !== handle && event.target.closest?.('button,a,input,select,textarea,summary'))) return;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, start: rect(), moved: false };
+      try { handle.setPointerCapture(event.pointerId); } catch { drag = null; }
+    };
+    const moving = event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+      drag.moved = true; event.preventDefault();
+      move(clampPosition({ x: drag.start.x + dx, y: drag.start.y + dy }, rect(), viewport()));
+    };
+    const end = event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const finished = drag; drag = null;
+      if (finished.moved) {
+        suppressUntil = now() + 500;
+        const position = clampPosition(rect(), rect(), viewport()); move(position); save(position);
+      }
+      try { if (handle.hasPointerCapture(finished.id)) handle.releasePointerCapture(finished.id); } catch { /* Released by browser. */ }
+    };
+    const click = event => {
+      if (event.detail !== 0 && now() < suppressUntil) {
+        suppressUntil = 0; event.preventDefault(); event.stopImmediatePropagation();
+      }
+    };
+    const events = { pointerdown: down, pointermove: moving, pointerup: end, pointercancel: end, lostpointercapture: end };
+    for (const [name, fn] of Object.entries(events)) handle.addEventListener(name, fn);
+    handle.addEventListener('click', click, true);
+    return () => {
+      if (drag) end({ pointerId: drag.id });
+      for (const [name, fn] of Object.entries(events)) handle.removeEventListener(name, fn);
+      handle.removeEventListener('click', click, true);
+    };
+  }
 
   function options(raw = {}) {
     const s = { ...DEFAULTS, ...raw };
@@ -453,7 +554,8 @@
     }
   }
 
-  const Core = { BASE, DEFAULTS, options, prizes, compareBags, parseBags, classify, waitPlan, claimInRoom, workerReply, WorkerBridge, csrfConfig, freshDB, dayKey, Engine };
+  const Core = { BASE, RELEASE, compareVersions, parseUpdateMeta, fetchRelease, clampPosition, bindDrag,
+    DEFAULTS, options, prizes, compareBags, parseBags, classify, waitPlan, claimInRoom, workerReply, WorkerBridge, csrfConfig, freshDB, dayKey, Engine };
   if (typeof window === 'undefined') {
     if (typeof module !== 'undefined') module.exports = Core;
     return;
@@ -475,6 +577,8 @@
     const requests = new Set();
     let releaseLock = null, acquiring = false, config = null, root, shadow, card, collapsed;
     let lastSnapshot = null;
+    let compactView = false, checkingVersion = false;
+    const currentVersion = typeof GM_info === 'object' ? String(GM_info.script?.version || '') : '';
     let apiOriginRid = rid;
     if (marker) { runWorker(marker); return; }
     const bridge = new core.WorkerBridge({ key: workerKey, get: key => GM_getValue(key, null),
@@ -678,8 +782,11 @@
       shadow = root.attachShadow({ mode: 'closed' });
       shadow.innerHTML = `<style>
         *{box-sizing:border-box}.card{width:370px;max-height:85vh;overflow:auto;padding:16px;background:#181b24;color:#e9edf4;border:1px solid #41495b;border-radius:14px;box-shadow:0 8px 36px #0006;font:13px/1.5 system-ui,"Microsoft YaHei",sans-serif}header,nav,.row{display:flex;justify-content:space-between;gap:8px;align-items:center}header b{font-size:15px}button{font:inherit;border:0;border-radius:7px;background:#ff6c2d;color:#fff;padding:7px 11px;cursor:pointer}.secondary{background:#343c4c}.small{padding:3px 8px;background:#343c4c}.muted{color:#9da8bd;font-size:12px;margin:9px 0}.totals{display:flex;justify-content:space-between;padding:12px;background:#242a38;border-radius:9px;margin:12px 0}.totals strong{color:#ffb16c;font-size:20px;display:block}.totals small{color:#a9b3c6}details{margin-top:12px;border-top:1px solid #343c4c;padding-top:10px}summary{cursor:pointer;color:#bfc8d8}label{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:9px 0}input{width:105px;padding:5px;background:#10141c;border:1px solid #495268;border-radius:5px;color:#fff;font:inherit}input[type=checkbox]{width:auto}.jobs{display:grid;gap:6px;margin-top:10px}.job{padding:8px;background:#242a38;border-radius:7px;font-size:12px}a{color:#ffc18c;text-decoration:none}ol{max-height:220px;overflow:auto;margin:10px 0;padding-left:20px;font-size:11px;color:#aebbd1}li{margin:5px 0}.chip{font:12px/1.5 system-ui,"Microsoft YaHei",sans-serif;padding:9px 12px;box-shadow:0 4px 20px #0004}.hidden{display:none!important}.status{white-space:normal;word-break:break-word}
-      </style><button class="chip">星推 · 已停止</button><section class="card hidden">
-        <header><b>斗鱼全民星推荐自动领取</b><button class="small fold">收起</button></header>
+        .card{max-width:calc(100vw - 16px);max-height:calc(100vh - 16px)}header,.chip{touch-action:none;user-select:none;cursor:grab}header:active,.chip:active{cursor:grabbing}.release{margin-top:9px;font-size:12px;color:#a9b3c6;flex-wrap:wrap}button:disabled{opacity:.55;cursor:wait}.version-status:empty{display:none}
+      </style><button class="chip" title="点击展开，拖动可调整位置">星推 · 已停止</button><section class="card hidden">
+        <header title="拖动标题栏可调整位置"><b>斗鱼全民星推荐自动领取</b><button class="small fold">收起</button></header>
+        <div class="row release"><span class="current-version"></span><button class="small update-check">检查版本</button><button class="small update-install hidden">更新到最新版</button></div>
+        <p class="muted version-status" role="status" aria-live="polite"></p>
         <div class="totals"><div><strong class="coins">0</strong><small>今日实得金币</small></div><div><strong class="stars">0</strong><small>星光棒</small></div><div><strong class="claims">0</strong><small>已领红包</small></div></div>
         <nav><button class="start">开始后台领取</button><button class="stop secondary">停止</button><button class="refresh secondary">刷新</button></nav>
         <p class="muted status"></p><div class="jobs"></div>
@@ -710,9 +817,52 @@
       shadow.querySelector('.records').addEventListener('toggle', render);
       shadow.querySelector('.export').addEventListener('click', exportLog);
       shadow.querySelector('.history').addEventListener('click', coinHistory);
-      document.documentElement.appendChild(root); fillSettings(); fold(readPrefs().compact); render();
+      shadow.querySelector('.current-version').textContent = `当前版本：${currentVersion || '未知'}`;
+      shadow.querySelector('.update-check').addEventListener('click', checkVersion);
+      shadow.querySelector('.update-install').addEventListener('click', openUpdatePage);
+      document.documentElement.appendChild(root); fillSettings(); fold(readPrefs().compact); render(); keepUIVisible();
+      const dragOptions = {
+        rect: () => { const r = root.getBoundingClientRect(); return { x: r.left, y: r.top, width: r.width, height: r.height }; },
+        viewport: () => ({ width: window.innerWidth, height: window.innerHeight }),
+        move: position => positionUI(position),
+        save: position => GM_setValue('bg2.uiPositions', { ...GM_getValue('bg2.uiPositions', {}), [compactView ? 'chip' : 'panel']: position })
+      };
+      core.bindDrag(shadow.querySelector('header'), dragOptions);
+      core.bindDrag(collapsed, dragOptions);
+      window.addEventListener('resize', keepUIVisible);
+      if (typeof ResizeObserver !== 'undefined') new ResizeObserver(keepUIVisible).observe(root);
     }
-    function fold(value) { card.classList.toggle('hidden', value); collapsed.classList.toggle('hidden', !value); }
+    function positionUI(position) {
+      const rect = root.getBoundingClientRect();
+      const safe = core.clampPosition(position, rect, { width: window.innerWidth, height: window.innerHeight });
+      root.style.left = `${safe.x}px`; root.style.top = `${safe.y}px`; root.style.bottom = 'auto';
+    }
+    function keepUIVisible() {
+      const rect = root.getBoundingClientRect(); positionUI({ x: rect.left, y: rect.top });
+    }
+    function fold(value) {
+      compactView = value; card.classList.toggle('hidden', value); collapsed.classList.toggle('hidden', !value);
+      const saved = GM_getValue('bg2.uiPositions', {})?.[value ? 'chip' : 'panel'];
+      positionUI(saved || { x: 18, y: window.innerHeight - root.getBoundingClientRect().height - 18 });
+    }
+    function openUpdatePage() { GM_openInTab(core.RELEASE.downloadURL, { active: true, insert: true, setParent: true }); }
+    async function checkVersion() {
+      if (checkingVersion) return;
+      checkingVersion = true;
+      const button = shadow.querySelector('.update-check'), install = shadow.querySelector('.update-install');
+      const status = shadow.querySelector('.version-status');
+      button.disabled = true; button.textContent = '检查中…'; install.classList.add('hidden'); status.textContent = '正在检查新版本…';
+      try {
+        core.compareVersions(currentVersion, currentVersion);
+        const latest = await core.fetchRelease(details => GM_xmlhttpRequest(details));
+        const order = core.compareVersions(latest, currentVersion);
+        if (order > 0) {
+          status.textContent = `发现新版本 ${latest}，当前为 ${currentVersion}`;
+          install.textContent = `更新到 ${latest}`; install.classList.remove('hidden');
+        } else status.textContent = order === 0 ? `已是最新版本 ${currentVersion}` : `本地版本较新，线上版本为 ${latest}`;
+      } catch (error) { status.textContent = error.message || '检查失败，请稍后重试'; }
+      finally { checkingVersion = false; button.disabled = false; button.textContent = '检查版本'; keepUIVisible(); }
+    }
     function fillSettings() {
       const s = readPrefs(); shadow.querySelectorAll('input').forEach(input => {
         if (input.type === 'checkbox') input.checked = s[input.name]; else input.value = s[input.name];
@@ -764,9 +914,7 @@
     }
     GM_registerMenuCommand('打开后台助手面板', () => fold(false));
     GM_registerMenuCommand('停止后台领取', stop);
-    GM_registerMenuCommand('安装或更新到最新版', () => GM_openInTab(
-      'https://raw.githubusercontent.com/ybl112/douyu-star-helper/main/douyu-star-background.user.js',
-      { active: true, insert: true, setParent: true }));
+    GM_registerMenuCommand('安装或更新到最新版', openUpdatePage);
     GM_addValueChangeListener('bg2.stopRequest', () => { if (engine.running) { engine.stop('manual', '已从其他页面停止'); publish(); render(); } });
     GM_addValueChangeListener(PREF, () => { if (engine.running && !readPrefs().enabled) { engine.stop('manual', '已停止'); publish(); } render(); });
     GM_addValueChangeListener(DB, render);
