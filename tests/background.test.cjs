@@ -7,7 +7,7 @@ const rawBag = (id, coins, extra = {}) => ({ id, code: `abcdef0123456789${id}`, 
 const roomPayload = (bags, name = '房间') => ({ error: 0, data: { anchorName: name, redBagList: bags } });
 const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 
-function setup({ rooms = { '101': [rawBag(1, 10000)] }, settings = {}, claim, square } = {}) {
+function setup({ rooms = { '101': [rawBag(1, 10000)] }, settings = {}, claim, square, enter, ready = true } = {}) {
   let now = Date.UTC(2026, 9, 22, 4);
   let saved = {};
   let sequence = 0;
@@ -15,12 +15,14 @@ function setup({ rooms = { '101': [rawBag(1, 10000)] }, settings = {}, claim, sq
   let opened = [];
   let revoked = [];
   let apiCalls = 0;
+  let readiness = { ready, readyAt: now };
   const s = { ...core.DEFAULTS, ...settings };
   const engine = new core.Engine({
     now: () => now, loadDB: () => structuredClone(saved), saveDB: v => { saved = structuredClone(v); },
-    loadSettings: () => s, makeToken: () => `t${++sequence}`, prepare() {}, revoke: t => revoked.push(t), ready: () => true,
+    loadSettings: () => s, makeToken: () => `t${++sequence}`, prepare() {}, revoke: t => revoked.push(t), ready: () => readiness,
     openTab: url => { const tab = { url, closed: false, close() { this.closed = true; } }; opened.push(tab); return tab; },
     api: {
+      enter,
       square: async () => { apiCalls++; return square ? square() : roomPayload(Object.keys(rooms).map(rid => ({ rid }))); },
       room: async rid => roomPayload(rooms[rid] || [], `主播${rid}`),
       claim: async job => { claimed.push(job.id); return claim ? claim(job) : { error: 0, data: { id: job.id, prizeList: [{ prizeType: 9, num: 37 }, { prizeType: 2, num: 4 }] } }; }
@@ -28,10 +30,11 @@ function setup({ rooms = { '101': [rawBag(1, 10000)] }, settings = {}, claim, sq
   });
   return { engine, s, opened, revoked, claimed,
     advance: ms => { now += ms; }, setNow: at => { now = at; }, now: () => now,
+    setReady(value) { readiness = value; },
     saved: () => saved, apiCalls: () => apiCalls,
-    async initialize() { await engine.start(); await engine.discover(engine.generation); await engine.tick(); await settle(); },
+    async initialize() { await engine.start(); await engine.discover(engine.generation); await engine.tick(); await settle(); await engine.tick(); await settle(); },
     async tick() { await engine.tick(); await settle(); },
-    async due() { now = Math.max(now, ...[...engine.jobs.values()].map(j => j.openedAt + j.delays[0])); await this.tick(); }
+    async due() { now = Math.max(now, ...[...engine.jobs.values()].map(j => j.due)); await this.tick(); }
   };
 }
 
@@ -94,18 +97,22 @@ test('custom daily cap counts confirmed claims and stops before further rooms', 
   assert.equal(h.saved().stopped.kind, 'cap');
 });
 
-test('waiting is bounded to five requests and never bursts on resume', async () => {
-  const h = setup({ claim: () => ({ error: 12006, msg: '稍等会儿才能抢哟' }) });
+test('waiting may exceed five requests but stays deadline-bounded without bursts on resume', async () => {
+  const h = setup({ rooms: { '101': [rawBag(1, 10000, { waitSec: 600 })] }, claim: () => ({ error: 12006, msg: '稍等会儿才能抢哟' }) });
   await h.initialize(); await h.tick(); await h.due();
   assert.equal(h.claimed.length, 1);
-  h.advance(600000); await h.tick();
+  h.advance(90000); await h.tick();
   assert.equal(h.claimed.length, 2);
   const job = [...h.engine.jobs.values()][0];
   assert.ok(job.due >= h.now() + 10000);
   await h.tick(); assert.equal(h.claimed.length, 2);
-  for (let i = 0; i < 3; i++) { h.advance(10000); await h.tick(); }
-  assert.equal(h.claimed.length, 5);
+  for (let i = 0; i < 4; i++) await h.due();
+  assert.equal(h.claimed.length, 6);
+  assert.equal(h.engine.jobs.size, 1);
+  h.setNow(job.deadlineAt); await h.tick();
   assert.equal(h.engine.jobs.size, 0);
+  assert.equal(h.saved().done.includes('101:1'), false);
+  assert.ok(h.saved().retryAfter['101:1'] > h.now());
 });
 
 test('uncertain POST timeout stops without blindly repeating the request', async () => {
@@ -208,4 +215,72 @@ test('already reaching a configured cap prevents opening any additional rooms', 
   assert.equal(await h.engine.start(), false);
   assert.equal(h.engine.running, false);
   assert.equal(h.opened.length, 0);
+});
+
+test('viewing delay starts when the activity is initialized, not when a tab opens', async () => {
+  const h = setup({ ready: false }); await h.initialize();
+  const openedAt = [...h.engine.jobs.values()][0].openedAt;
+  h.advance(45000); await h.tick(); assert.equal(h.claimed.length, 0);
+  h.setReady({ ready: true, readyAt: h.now() }); await h.tick();
+  const job = [...h.engine.jobs.values()][0];
+  assert.equal(job.due, openedAt + 45000 + 45000);
+  h.advance(44999); await h.tick(); assert.equal(h.claimed.length, 0);
+  h.advance(1); await h.tick(); assert.equal(h.claimed.length, 1);
+});
+
+test('a sixth response can succeed after five not-ready responses', async () => {
+  let tries = 0;
+  const h = setup({ rooms: { '101': [rawBag(1, 10000, { waitSec: 300 })] }, claim: () => ++tries <= 5
+    ? { error: 12006, msg: '稍等会儿才能抢哟' } : { error: 0, data: { prizeList: [{ prizeType: 9, num: 21 }] } } });
+  await h.initialize();
+  for (let i = 0; i < 6; i++) await h.due();
+  assert.equal(h.saved().claims, 1); assert.equal(h.saved().coins, 21);
+  assert.equal(h.claimed.length, 6);
+});
+
+test('repeated full waitSec from room/list never pushes the deadline forward', async () => {
+  const h = setup({ claim: () => ({ error: 12006 }) }); await h.initialize();
+  const job = [...h.engine.jobs.values()][0], deadline = job.deadlineAt;
+  await h.due(); await h.due(); await h.due();
+  assert.equal(job.deadlineAt, deadline);
+});
+
+test('a not-ready response is rechecked against the actual terminal room state', async () => {
+  const rooms = { '101': [rawBag(1, 10000)] };
+  const h = setup({ rooms, claim: () => { rooms['101'][0].status = 3; return { error: 12006 }; } });
+  await h.initialize(); await h.due();
+  assert.equal(h.engine.jobs.size, 0);
+  assert.ok(h.saved().done.includes('101:1'));
+  assert.equal(h.saved().records[0].kind, 'exhausted');
+});
+
+test('a temporarily missing packet needs two confirmations and remains retryable', async () => {
+  const rooms = { '101': [rawBag(1, 10000)] };
+  const h = setup({ rooms, claim: () => { rooms['101'] = []; return { error: 12006 }; } });
+  await h.initialize(); await h.due(); assert.equal(h.engine.jobs.size, 1);
+  await h.due(); assert.equal(h.engine.jobs.size, 0);
+  assert.equal(h.saved().done.includes('101:1'), false);
+});
+
+test('upgrading recovers previously timed-out packets without clearing actual successes', () => {
+  const now = Date.UTC(2026, 9, 22, 4);
+  const db = core.freshDB({ day: core.dayKey(now), done: ['101:1', '101:2'],
+    records: [{ rid: '101', bagId: 1, kind: 'timeout' }, { rid: '101', bagId: 2, kind: 'success' }] }, now);
+  assert.deepEqual(db.done, ['101:2']); assert.equal(db.schemaVersion, 2);
+});
+
+test('official activity entry registration occurs before a background room opens', async () => {
+  const seen = [];
+  const h = setup({ enter: async bag => { seen.push({ rid: bag.rid, id: bag.id, opened: h.opened.length }); return { error: 0 }; } });
+  await h.initialize();
+  assert.deepEqual(seen, [{ rid: '101', id: 1, opened: 0 }]);
+  assert.equal(h.opened.length, 1);
+});
+
+test('limit or login errors while registering activity prevent opening worker tabs', async () => {
+  for (const payload of [{ error: -1, msg: '已达到每日领取上限' }, { error: -9, msg: '请登录' }]) {
+    const h = setup({ enter: async () => payload }); await h.initialize();
+    assert.equal(h.engine.running, false); assert.equal(h.opened.length, 0);
+    assert.equal(h.claimed.length, 0);
+  }
 });

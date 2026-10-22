@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         斗鱼全民星推荐自动领取
 // @namespace    local.douyu.star.helper
-// @version      2.0.0
+// @version      2.0.1
 // @description  后台自动领取全民星推荐活动红包，支持奖池筛选、到账统计及每日上限自动停止。
 // @homepageURL  https://github.com/ybl112/douyu-star-helper
 // @supportURL   https://github.com/ybl112/douyu-star-helper/issues
@@ -14,6 +14,7 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @grant        window.close
@@ -21,8 +22,8 @@
 // ==/UserScript==
 
 /*
- * Independently implemented controller. Protocol field mapping and the bounded
- * five-attempt schedule were adapted from ienone/douyu-qmx-pro (MIT):
+ * Independently implemented controller. Protocol field mapping and dynamic
+ * CSRF configuration were adapted from ienone/douyu-qmx-pro (MIT):
  * https://github.com/ienone/douyu-qmx-pro
  * Reference revision: 93accebf2983a49811ee218da7adf50547408575
  * Upstream credits ysl-ovo's original userscript as its origin:
@@ -47,7 +48,7 @@
  * SOFTWARE.
  */
 
-/* global GM_getValue, GM_setValue, GM_deleteValue, GM_addValueChangeListener, GM_registerMenuCommand, GM_openInTab */
+/* global GM_getValue, GM_setValue, GM_deleteValue, GM_addValueChangeListener, GM_removeValueChangeListener, GM_registerMenuCommand, GM_openInTab */
 (function () {
   'use strict';
 
@@ -115,12 +116,66 @@
     return 'unknown';
   }
 
-  function offsets(seconds) {
-    // Adapted from getSnatchAttemptOffsets (MIT), preserving the five-attempt upper bound.
-    // https://github.com/ienone/douyu-qmx-pro/blob/93accebf2983a49811ee218da7adf50547408575/src/features/redbag/RedBagState.js
-    const wait = Math.max(30, Math.round(number(seconds, 90)));
-    const first = Math.round(wait * (wait >= 300 ? 2 / 3 : 1 / 2));
-    return [first, Math.max(first + 10, wait - 20), wait, wait + 20, wait + 50].map(s => s * 1000);
+  function waitPlan(seconds, startedAt) {
+    const wait = Math.max(0, number(seconds, 90)) * 1000;
+    const expectedAt = startedAt + wait;
+    // Retain upstream's initial probe estimate; further scheduling follows room state.
+    const firstAt = startedAt + Math.round(wait * (wait >= 300000 ? 2 / 3 : 1 / 2));
+    return { firstAt, expectedAt, deadlineAt: expectedAt + Math.max(120000, Math.min(300000, wait / 2)) };
+  }
+
+  async function claimInRoom(api, rid, bagId) {
+    const payload = await api.room(rid);
+    if (payload?.error != null && Number(payload.error) !== 0) return payload;
+    const bags = parseBags(payload, rid, Date.now());
+    const original = payload.data.redBagList.find(item => Number(item.id) === Number(bagId));
+    if (original && Number(original.status) === 3) return { localState: 'ended' };
+    const bag = bags.find(item => item.id === Number(bagId));
+    if (!bag) return { localState: 'missing' };
+    return api.claim(bag);
+  }
+
+  function workerReply(payload) {
+    if (['ended', 'missing'].includes(payload?.localState)) return { localState: payload.localState };
+    const result = classify(payload);
+    const messages = { limit: '已达到每日领取上限', auth: '请重新登录', risk: '需要验证',
+      already: '已领取', exhausted: '红包已结束', waiting: '稍等会儿才能抢', success: 'success', unknown: '未知响应' };
+    return { error: payload?.error, msg: messages[result], data: {
+      ...(Array.isArray(payload?.data?.prizeList) ? { prizeList: payload.data.prizeList.map(item => ({
+        num: number(item.num), prizeType: number(item.prizeType ?? item.ptype, -1)
+      })) } : {})
+    } };
+  }
+
+  class WorkerBridge {
+    constructor(deps) { Object.assign(this, deps); this.pending = new Map(); }
+    claim(token, bagId) {
+      const key = this.key(token), task = this.get(key);
+      if (!task?.ready) return Promise.reject(new Error('工作页活动尚未就绪'));
+      if ([...this.pending.values()].some(item => item.token === token)) return Promise.reject(new Error('该工作页正在领取'));
+      const requestId = this.id();
+      return new Promise((resolve, reject) => {
+        let listener, timeout;
+        const finish = (error, payload) => {
+          if (!this.pending.has(requestId)) return;
+          this.pending.delete(requestId); this.unlisten(listener); this.clearTimer(timeout);
+          if (error) reject(error); else resolve(payload);
+        };
+        listener = this.listen(key, (_key, _old, value) => {
+          if (!value || value.revoked) { finish(new Error('工作页任务已取消')); return; }
+          if (value.response?.requestId !== requestId) return;
+          if (value.response.error) finish(new Error(value.response.error));
+          else finish(null, value.response.payload);
+        });
+        timeout = this.setTimer(() => finish(new Error('工作页未及时响应领取请求')), 90000);
+        this.pending.set(requestId, { token, cancel: () => finish(new Error('领取请求已取消')) });
+        try {
+          // Only the bag id is shared. The worker obtains code and CSRF values locally.
+          this.set(key, { ...task, command: { requestId, bagId, at: this.now() }, response: null });
+        } catch (error) { finish(error); }
+      });
+    }
+    cancelAll() { for (const item of [...this.pending.values()]) item.cancel(); }
   }
 
   function csrfConfig(source) {
@@ -135,9 +190,20 @@
   }
 
   function freshDB(old = {}, now = Date.now()) {
-    return { records: [], done: [], day: dayKey(now), requests: 0, claims: 0, coins: 0, stars: 0,
+    const db = { records: [], done: [], retryAfter: {}, day: dayKey(now), requests: 0, claims: 0, coins: 0, stars: 0,
       stopped: null, ...old, ...(old.day !== dayKey(now)
-        ? { day: dayKey(now), requests: 0, claims: 0, coins: 0, stars: 0, done: [], stopped: null } : {}) };
+        ? { day: dayKey(now), requests: 0, claims: 0, coins: 0, stars: 0, done: [], retryAfter: {}, stopped: null } : {}) };
+    if (db.schemaVersion !== 2) {
+      const terminal = new Set(), unfinished = new Set();
+      for (const record of db.records) {
+        if (!safeId(record.rid) || !safeId(record.bagId)) continue;
+        const key = `${record.rid}:${record.bagId}`;
+        (['success', 'exhausted', 'already'].includes(record.kind) ? terminal : unfinished).add(key);
+      }
+      db.done = db.done.filter(key => !unfinished.has(key) || terminal.has(key));
+      db.schemaVersion = 2;
+    }
+    return db;
   }
 
   class Engine {
@@ -179,7 +245,12 @@
     }
     finish(job, kind, text, reward) {
       job.tab?.close(); this.revoke(job.token); this.jobs.delete(job.key);
-      if (!this.db.done.includes(job.key)) this.db.done.push(job.key);
+      if (['success', 'exhausted', 'already'].includes(kind)) {
+        if (!this.db.done.includes(job.key)) this.db.done.push(job.key);
+        delete this.db.retryAfter[job.key];
+      } else {
+        this.db.retryAfter[job.key] = this.now() + 300000;
+      }
       this.db.done = this.db.done.slice(-3000);
       if (kind === 'success') {
         this.db.claims++; this.db.coins += reward.coins; this.db.stars += reward.stars;
@@ -217,6 +288,7 @@
         for (const bag of found) {
           const key = keyOf(bag);
           if (!this.jobs.has(key) && !this.inFlight.has(key) && !this.db.done.includes(key) &&
+              !(this.db.retryAfter[key] > this.now()) &&
               bag.pool.coins >= s.minCoins && bag.waitSec <= s.maxWait) map.set(key, bag);
         }
         this.candidates = [...map.values()].sort(compareBags);
@@ -239,9 +311,20 @@
         const current = parseBags(payload, bag.rid, this.now()).find(item => keyOf(item) === key);
         const s = this.settings();
         if (!current || current.pool.coins < s.minCoins || current.waitSec > s.maxWait || this.db.done.includes(key)) return;
+        if (this.api.enter) {
+          const entry = await this.api.enter(current);
+          if (!this.current(gen)) return;
+          if (entry?.error == null || Number(entry.error) !== 0) {
+            const result = classify(entry);
+            if (['limit', 'auth', 'risk'].includes(result)) {
+              this.stop(result, result === 'limit' ? '斗鱼已提示每日领取上限，已停止全部任务' : '进入活动时需要登录或验证，已停止');
+            } else this.log('error', '活动入口登记失败，暂不打开工作页', { rid: current.rid, bagId: current.id });
+            return;
+          }
+        }
         const token = this.makeToken();
         const job = { ...current, key, token, openedAt: this.now(), tries: 0, lastTry: 0,
-          step: 'loading', due: 0, delays: offsets(current.waitSec) };
+          step: 'loading', due: 0, startedAt: 0, expectedAt: 0, deadlineAt: 0, missing: 0 };
         this.prepare(token, current.rid);
         this.jobs.set(key, job);
         job.tab = this.openTab(`https://www.douyu.com/${current.rid}#dy-star-worker=${token}`);
@@ -257,11 +340,16 @@
       if (!this.current(gen) || !this.jobs.has(job.key) || job.busy) return;
       if (job.tab?.closed) { this.finish(job, 'closed', '工作标签页已关闭'); return; }
       if (job.step === 'loading') {
-        if (!this.ready(job.token)) {
-          if (this.now() - job.openedAt > 60000) this.finish(job, 'timeout', '工作页加载超时，请检查页面休眠设置');
+        const worker = this.ready(job.token);
+        if (!worker?.ready) {
+          if (this.now() - job.openedAt > 120000) this.finish(job, 'timeout', '工作页活动初始化超时，请检查页面是否正常加载');
           return;
         }
-        job.step = 'waiting'; job.due = Math.max(job.openedAt + job.delays[0], this.now() + 1000);
+        job.startedAt = Math.max(job.openedAt, Math.min(this.now(), number(worker.readyAt, this.now())));
+        Object.assign(job, waitPlan(job.waitSec, job.startedAt));
+        job.step = 'waiting'; job.due = Math.max(job.firstAt, this.now() + 1000);
+        this.log('ready', `房间 ${job.rid} 活动已初始化，等待 ${job.waitSec} 秒`,
+          { rid: job.rid, bagId: job.id, waitSec: job.waitSec, startedAt: job.startedAt });
       }
       if (this.now() < job.due) return;
       if (this.settings().dailyCap && this.db.claims >= this.settings().dailyCap) {
@@ -273,6 +361,12 @@
         this.db.requests++; this.persist();
         const payload = await this.api.claim(job);
         if (!this.current(gen)) return;
+        if (payload?.localState === 'ended') {
+          this.finish(job, 'exhausted', '工作页确认红包已结束，继续下一任务'); return;
+        }
+        if (payload?.localState === 'missing') {
+          await this.continueWaiting(job, gen, '工作页未找到该红包'); return;
+        }
         const result = classify(payload);
         if (result === 'success') {
           const reward = prizes(payload.data.prizeList);
@@ -284,12 +378,8 @@
           this.stop(result, result === 'auth' ? '登录状态或请求凭证失效，已停止' : '斗鱼要求验证或限制参与，已停止');
         } else if (['exhausted', 'already'].includes(result)) {
           this.finish(job, result, result === 'already' ? '该红包已领取' : '红包已派完，继续找下一包');
-        } else if (result === 'waiting' && job.tries < job.delays.length) {
-          job.step = 'waiting';
-          // Absolute deadlines prevent a burst of requests after a suspended tab resumes.
-          job.due = Math.max(job.openedAt + job.delays[job.tries], this.now() + 10000);
         } else if (result === 'waiting') {
-          this.finish(job, 'timeout', '有限次等待后仍未开放，跳过该包');
+          await this.continueWaiting(job, gen, '服务端返回12006');
         } else {
           this.finish(job, 'unknown', '领取响应无法确认');
           this.stop('protocol', '领取接口出现未知响应，已停止，请查看记录');
@@ -299,6 +389,41 @@
         this.finish(job, 'unknown', `请求失败，结果未确认：${error.message}`);
         this.stop('error', '领取请求失败，已停止以避免重复提交');
       } finally { job.busy = false; }
+    }
+    async continueWaiting(job, gen, reason) {
+      let status = null;
+      try {
+        const payload = await this.api.room(job.rid);
+        if (!this.current(gen)) return;
+        if (Number(payload?.error) === 0 && Array.isArray(payload.data?.redBagList)) {
+          const same = payload.data.redBagList.find(item => Number(item.id) === job.id);
+          if (same) {
+            job.missing = 0; status = Number(same.status);
+            if (status === 3) { this.finish(job, 'exhausted', '复查确认红包已结束，继续下一任务'); return; }
+            // waitSec may be the full required viewing duration on every response.
+            // Do not reset expectedAt/deadlineAt from a repeated room-list response.
+            if (typeof same.code === 'string') job.code = same.code;
+          } else if (++job.missing >= 2) {
+            this.finish(job, 'missing', '连续两次未查到该红包，稍后重新检查'); return;
+          }
+        } else {
+          const result = classify(payload);
+          if (['limit', 'auth', 'risk'].includes(result)) {
+            this.stop(result, result === 'limit' ? '斗鱼已提示每日领取上限，已停止全部任务' : '复查时登录状态失效或需要验证，已停止'); return;
+          }
+        }
+      } catch {
+        if (!this.current(gen)) return;
+      }
+      const elapsedSec = Math.round((this.now() - job.startedAt) / 1000);
+      if (this.now() >= job.deadlineAt) {
+        this.finish(job, 'not_ready', `等待 ${elapsedSec} 秒后仍未满足领取条件，5分钟后重新检查`);
+        return;
+      }
+      const delay = Math.min(30000, 10000 + job.tries * 5000);
+      job.step = 'waiting'; job.due = Math.min(job.deadlineAt, this.now() + delay);
+      this.log('waiting', `房间 ${job.rid} 仍在等待领取条件，${Math.ceil((job.due - this.now()) / 1000)} 秒后复查`,
+        { rid: job.rid, bagId: job.id, attempt: job.tries, elapsedSec, serverStatus: status, reason });
     }
     async tick() {
       if (!this.running || this.ticking) return;
@@ -328,7 +453,7 @@
     }
   }
 
-  const Core = { BASE, DEFAULTS, options, prizes, compareBags, parseBags, classify, offsets, csrfConfig, freshDB, dayKey, Engine };
+  const Core = { BASE, DEFAULTS, options, prizes, compareBags, parseBags, classify, waitPlan, claimInRoom, workerReply, WorkerBridge, csrfConfig, freshDB, dayKey, Engine };
   if (typeof window === 'undefined') {
     if (typeof module !== 'undefined') module.exports = Core;
     return;
@@ -347,11 +472,15 @@
     const owner = uuid();
     const rid = location.pathname.match(/\d+/)[0];
     const marker = location.hash.match(/(?:^#|&)dy-star-worker=([a-f0-9]{32})(?:&|$)/)?.[1];
-    if (marker) { runWorker(marker); return; }
     const requests = new Set();
     let releaseLock = null, acquiring = false, config = null, root, shadow, card, collapsed;
     let lastSnapshot = null;
     let apiOriginRid = rid;
+    if (marker) { runWorker(marker); return; }
+    const bridge = new core.WorkerBridge({ key: workerKey, get: key => GM_getValue(key, null),
+      set: (key, value) => GM_setValue(key, value), listen: GM_addValueChangeListener,
+      unlisten: GM_removeValueChangeListener, id: uuid, now: () => Date.now(),
+      setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: id => clearTimeout(id) });
 
     function realRid() {
       const source = [...document.scripts].filter(script => !script.src).map(script => script.textContent).join('\n');
@@ -362,20 +491,80 @@
       const initial = GM_getValue(key, null);
       // Only a task actually registered by this script may mark itself ready or close itself.
       if (!initial || initial.rid !== rid || initial.expires < Date.now()) return;
-      const loadedAt = Date.now();
+      config = embeddedConfig() || initial.csrfConfig;
+      let lastOpen = 0, lastTabClick = 0, activitySeenAt = 0, busy = false, lastCommand = '';
       const mute = () => document.querySelectorAll('video,audio').forEach(media => { media.muted = true; });
       mute();
       document.addEventListener('play', mute, true);
+      function clickLabel(doc, pattern) {
+        if (!doc.body) return false;
+        const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          const parent = node.parentElement;
+          if (!parent || parent.closest('script,style') || !pattern.test(String(node.nodeValue).trim())) continue;
+          const target = parent.closest('button,a,[role="button"]') || parent;
+          target.click(); return true;
+        }
+        return false;
+      }
+      function initializeActivity() {
+        const frame = document.querySelector('iframe[src*="/pages/new-anchor-support"]');
+        if (!frame) {
+          activitySeenAt = 0;
+          if (Date.now() - lastOpen > 10000) { lastOpen = Date.now(); clickLabel(document, /^全民星推(?:荐)?$/); }
+          return false;
+        }
+        let doc;
+        try { doc = frame.contentDocument; } catch { return false; }
+        const content = doc?.body?.innerText || '';
+        if (!/做任务得金币|我的金币|抢红包/.test(content)) {
+          activitySeenAt = 0;
+          if (doc && Date.now() - lastTabClick > 3000) { lastTabClick = Date.now(); clickLabel(doc, /^抽大奖$/); }
+          return false;
+        }
+        if (!activitySeenAt) activitySeenAt = Date.now();
+        return Date.now() - activitySeenAt >= 3000;
+      }
+      function valid(task) {
+        const lease = GM_getValue(LEASE, {});
+        return task && !task.revoked && task.expires >= Date.now() && lease.owner === initial.owner && lease.until >= Date.now() - 90000;
+      }
+      async function dispatch() {
+        const task = GM_getValue(key, null), command = task?.command;
+        if (busy || !valid(task) || !task.ready || !command || command.requestId === lastCommand) return;
+        if (!safeId(command.bagId)) return;
+        busy = true; lastCommand = command.requestId;
+        let response;
+        try {
+          if (!initializeActivity()) throw new Error('活动面板未保持就绪，请重新启动任务');
+          const payload = await core.claimInRoom({ room: id => request(`${BASE}/redbag/room/list?rid=${id}`), claim }, rid, command.bagId);
+          response = { requestId: command.requestId, payload: core.workerReply(payload) };
+        } catch (error) { response = { requestId: command.requestId, error: String(error.message).slice(0, 160) }; }
+        finally { busy = false; }
+        const latest = GM_getValue(key, null);
+        if (valid(latest) && latest.command?.requestId === command.requestId) GM_setValue(key, { ...latest, response });
+      }
+      const listener = GM_addValueChangeListener(key, (_key, _old, task) => {
+        if (!task || task.revoked) {
+          for (const controller of requests) controller.abort();
+          GM_removeValueChangeListener(listener); window.close(); return;
+        }
+        void dispatch();
+      });
       const workerTimer = setInterval(() => {
         mute();
-        const task = GM_getValue(key, null), lease = GM_getValue(LEASE, {});
-        if (!task || task.revoked || task.expires < Date.now() ||
-            (lease.owner !== initial.owner || lease.until < Date.now() - 90000)) {
-          clearInterval(workerTimer); window.close(); return;
+        const task = GM_getValue(key, null);
+        if (!valid(task)) {
+          clearInterval(workerTimer); GM_removeValueChangeListener(listener);
+          for (const controller of requests) controller.abort();
+          window.close(); return;
         }
-        if (!task.ready && document.readyState === 'complete' && Date.now() - loadedAt >= 8000) {
-          GM_setValue(key, { ...task, ready: true });
+        if (!task.ready && initializeActivity()) {
+          const latest = GM_getValue(key, null);
+          if (valid(latest)) GM_setValue(key, { ...latest, ready: true, readyAt: Date.now() });
         }
+        void dispatch();
       }, 2000);
     }
 
@@ -404,26 +593,33 @@
       if (!part) return '';
       try { return decodeURIComponent(part.slice(name.length + 1)); } catch { return ''; }
     }
-    async function claim(job) {
+    async function postForm(path, fields) {
       config = embeddedConfig() || config;
       if (!config) throw new Error('页面缺少动态请求配置');
       let token = cookieValue(config.cookie);
       if (!token) { await request('/wgapi/livenc/liveweb/csrfApi/getCsrfCookie'); token = cookieValue(config.cookie); }
       if (!token) throw new Error('登录凭证不可用');
-      const body = new URLSearchParams({ rid: job.rid, id: String(job.id), code: job.code, [config.field]: token });
-      return request(`${BASE}/redbag/snatch`, { method: 'POST',
+      const body = new URLSearchParams({ ...fields, [config.field]: token });
+      return request(path, { method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body: body.toString() });
+    }
+    async function claim(job) {
+      return postForm(`${BASE}/redbag/snatch`, { rid: job.rid, id: String(job.id), code: job.code });
     }
     const engine = new core.Engine({
       now: () => Date.now(), loadDB: () => GM_getValue(DB, {}), saveDB: value => GM_setValue(DB, value),
       loadSettings: readPrefs, makeToken: uuid,
       api: { square: () => request(`${BASE}/redbag/square/list?rid=${apiOriginRid}`),
-        room: id => request(`${BASE}/redbag/room/list?rid=${id}`), claim },
-      prepare: (token, roomId) => GM_setValue(workerKey(token), { owner, rid: roomId, ready: false, expires: Date.now() + 40 * 60000 }),
+        // The current official recommendation entry calls square/read before opening a room.
+        // https://shark2.douyucdn.cn/front-publish/new-anchor-support-master/js/main_c840364.js
+        enter: bag => postForm(`${BASE}/redbag/square/read`, { rid: bag.rid, rbId: String(bag.id) }),
+        room: id => request(`${BASE}/redbag/room/list?rid=${id}`), claim: job => bridge.claim(job.token, job.id) },
+      prepare: (token, roomId) => GM_setValue(workerKey(token), { owner, rid: roomId, csrfConfig: config,
+        ready: false, readyAt: 0, expires: Date.now() + 40 * 60000 }),
       revoke: token => GM_deleteValue(workerKey(token)),
-      ready: token => Boolean(GM_getValue(workerKey(token), {}).ready),
+      ready: token => GM_getValue(workerKey(token), {}),
       openTab: url => GM_openInTab(url, { active: false, insert: true, setParent: true }),
-      abort: () => { for (const request of requests) request.abort(); },
+      abort: () => { bridge.cancelAll(); for (const request of requests) request.abort(); },
       onStop: () => {
         writePrefs({ enabled: false });
         const lease = GM_getValue(LEASE, {}); if (lease.owner === owner) GM_setValue(LEASE, {});
@@ -585,6 +781,7 @@
       // Preserve the start preference for a deliberate refresh, but release our worker pages.
       for (const job of engine.jobs.values()) { job.tab?.close(); engine.revoke(job.token); }
       engine.running = false; engine.generation++; engine.jobs.clear(); engine.inFlight.clear(); engine.candidates = [];
+      bridge.cancelAll();
       for (const controller of requests) controller.abort();
       if (GM_getValue(LEASE, {}).owner === owner) GM_setValue(LEASE, {});
       if (releaseLock) { releaseLock(); releaseLock = null; }
